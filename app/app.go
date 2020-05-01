@@ -1,44 +1,103 @@
 package app
 
 import (
-	"fmt"
 	"io"
 	"os"
-	"sort"
+
+	dbm "github.com/tendermint/tm-db"
 
 	abci "github.com/tendermint/tendermint/abci/types"
-	cmn "github.com/tendermint/tendermint/libs/common"
-	dbm "github.com/tendermint/tendermint/libs/db"
 	"github.com/tendermint/tendermint/libs/log"
+	tmos "github.com/tendermint/tendermint/libs/os"
 
 	bam "github.com/cosmos/cosmos-sdk/baseapp"
 	"github.com/cosmos/cosmos-sdk/codec"
+	"github.com/cosmos/cosmos-sdk/simapp"
 	sdk "github.com/cosmos/cosmos-sdk/types"
+	"github.com/cosmos/cosmos-sdk/types/module"
+	"github.com/cosmos/cosmos-sdk/version"
 	"github.com/cosmos/cosmos-sdk/x/auth"
+	"github.com/cosmos/cosmos-sdk/x/auth/vesting"
 	"github.com/cosmos/cosmos-sdk/x/bank"
 	"github.com/cosmos/cosmos-sdk/x/crisis"
 	distr "github.com/cosmos/cosmos-sdk/x/distribution"
+	"github.com/cosmos/cosmos-sdk/x/evidence"
+	"github.com/cosmos/cosmos-sdk/x/genutil"
 	"github.com/cosmos/cosmos-sdk/x/gov"
 	"github.com/cosmos/cosmos-sdk/x/mint"
 	"github.com/cosmos/cosmos-sdk/x/params"
+	paramsclient "github.com/cosmos/cosmos-sdk/x/params/client"
 	"github.com/cosmos/cosmos-sdk/x/slashing"
 	"github.com/cosmos/cosmos-sdk/x/staking"
+	"github.com/cosmos/cosmos-sdk/x/supply"
+
+	"github.com/kava-labs/kava/x/auction"
+	"github.com/kava-labs/kava/x/bep3"
+	"github.com/kava-labs/kava/x/cdp"
+	"github.com/kava-labs/kava/x/committee"
+	"github.com/kava-labs/kava/x/incentive"
+	"github.com/kava-labs/kava/x/kavadist"
+	"github.com/kava-labs/kava/x/pricefeed"
+	validatorvesting "github.com/kava-labs/kava/x/validator-vesting"
 )
 
 const (
-	appName = "kava"
-	// DefaultKeyPass contains the default key password for genesis transactions
-	DefaultKeyPass   = "12345678"
+	appName          = "kava"
 	Bech32MainPrefix = "kava"
+	Bip44CoinType    = 459 // see https://github.com/satoshilabs/slips/blob/master/slip-0044.md
 )
 
-// default home directories for expected binaries
 var (
+	// default home directories for expected binaries
 	DefaultCLIHome  = os.ExpandEnv("$HOME/.kvcli")
 	DefaultNodeHome = os.ExpandEnv("$HOME/.kvd")
+
+	// ModuleBasics manages simple versions of full app modules. It's used for things such as codec registration and genesis file verification.
+	ModuleBasics = module.NewBasicManager(
+		genutil.AppModuleBasic{},
+		auth.AppModuleBasic{},
+		validatorvesting.AppModuleBasic{},
+		bank.AppModuleBasic{},
+		staking.AppModuleBasic{},
+		mint.AppModuleBasic{},
+		distr.AppModuleBasic{},
+		gov.NewAppModuleBasic(paramsclient.ProposalHandler, distr.ProposalHandler, committee.ProposalHandler),
+		params.AppModuleBasic{},
+		crisis.AppModuleBasic{},
+		slashing.AppModuleBasic{},
+		supply.AppModuleBasic{},
+		evidence.AppModuleBasic{},
+		auction.AppModuleBasic{},
+		cdp.AppModuleBasic{},
+		pricefeed.AppModuleBasic{},
+		committee.AppModuleBasic{},
+		bep3.AppModuleBasic{},
+		kavadist.AppModuleBasic{},
+		incentive.AppModuleBasic{},
+	)
+
+	// module account permissions
+	mAccPerms = map[string][]string{
+		auth.FeeCollectorName:       nil,
+		distr.ModuleName:            nil,
+		mint.ModuleName:             {supply.Minter},
+		staking.BondedPoolName:      {supply.Burner, supply.Staking},
+		staking.NotBondedPoolName:   {supply.Burner, supply.Staking},
+		gov.ModuleName:              {supply.Burner},
+		validatorvesting.ModuleName: {supply.Burner},
+		auction.ModuleName:          nil,
+		cdp.ModuleName:              {supply.Minter, supply.Burner},
+		cdp.LiquidatorMacc:          {supply.Minter, supply.Burner},
+		cdp.SavingsRateMacc:         {supply.Minter},
+		bep3.ModuleName:             {supply.Minter, supply.Burner},
+		kavadist.ModuleName:         {supply.Minter},
+	}
 )
 
-// Extended ABCI application
+// Verify app interface at compile time
+var _ simapp.App = (*App)(nil)
+
+// App represents an extended ABCI application
 type App struct {
 	*bam.BaseApp
 	cdc *codec.Codec
@@ -46,30 +105,35 @@ type App struct {
 	invCheckPeriod uint
 
 	// keys to access the substores
-	keyMain          *sdk.KVStoreKey
-	keyAccount       *sdk.KVStoreKey
-	keyStaking       *sdk.KVStoreKey
-	tkeyStaking      *sdk.TransientStoreKey
-	keySlashing      *sdk.KVStoreKey
-	keyMint          *sdk.KVStoreKey
-	keyDistr         *sdk.KVStoreKey
-	tkeyDistr        *sdk.TransientStoreKey
-	keyGov           *sdk.KVStoreKey
-	keyFeeCollection *sdk.KVStoreKey
-	keyParams        *sdk.KVStoreKey
-	tkeyParams       *sdk.TransientStoreKey
+	keys  map[string]*sdk.KVStoreKey
+	tkeys map[string]*sdk.TransientStoreKey
 
-	// Manage getting and setting accounts
-	accountKeeper       auth.AccountKeeper
-	feeCollectionKeeper auth.FeeCollectionKeeper
-	bankKeeper          bank.Keeper
-	stakingKeeper       staking.Keeper
-	slashingKeeper      slashing.Keeper
-	mintKeeper          mint.Keeper
-	distrKeeper         distr.Keeper
-	govKeeper           gov.Keeper
-	crisisKeeper        crisis.Keeper
-	paramsKeeper        params.Keeper
+	// keepers from all the modules
+	accountKeeper   auth.AccountKeeper
+	bankKeeper      bank.Keeper
+	supplyKeeper    supply.Keeper
+	stakingKeeper   staking.Keeper
+	slashingKeeper  slashing.Keeper
+	mintKeeper      mint.Keeper
+	distrKeeper     distr.Keeper
+	govKeeper       gov.Keeper
+	crisisKeeper    crisis.Keeper
+	paramsKeeper    params.Keeper
+	evidenceKeeper  evidence.Keeper
+	vvKeeper        validatorvesting.Keeper
+	auctionKeeper   auction.Keeper
+	cdpKeeper       cdp.Keeper
+	pricefeedKeeper pricefeed.Keeper
+	committeeKeeper committee.Keeper
+	bep3Keeper      bep3.Keeper
+	kavadistKeeper  kavadist.Keeper
+	incentiveKeeper incentive.Keeper
+
+	// the module manager
+	mm *module.Manager
+
+	// simulation manager
+	sm *module.SimulationManager
 }
 
 // NewApp returns a reference to an initialized App.
@@ -81,124 +145,282 @@ func NewApp(logger log.Logger, db dbm.DB, traceStore io.Writer, loadLatest bool,
 
 	bApp := bam.NewBaseApp(appName, logger, db, auth.DefaultTxDecoder(cdc), baseAppOptions...)
 	bApp.SetCommitMultiStoreTracer(traceStore)
+	bApp.SetAppVersion(version.Version)
+
+	keys := sdk.NewKVStoreKeys(
+		bam.MainStoreKey, auth.StoreKey, staking.StoreKey,
+		supply.StoreKey, mint.StoreKey, distr.StoreKey, slashing.StoreKey,
+		gov.StoreKey, params.StoreKey, evidence.StoreKey, validatorvesting.StoreKey,
+		auction.StoreKey, cdp.StoreKey, pricefeed.StoreKey, bep3.StoreKey,
+		kavadist.StoreKey, incentive.StoreKey, committee.StoreKey,
+	)
+	tkeys := sdk.NewTransientStoreKeys(params.TStoreKey)
 
 	var app = &App{
-		BaseApp:          bApp,
-		cdc:              cdc,
-		invCheckPeriod:   invCheckPeriod,
-		keyMain:          sdk.NewKVStoreKey(bam.MainStoreKey),
-		keyAccount:       sdk.NewKVStoreKey(auth.StoreKey),
-		keyStaking:       sdk.NewKVStoreKey(staking.StoreKey),
-		tkeyStaking:      sdk.NewTransientStoreKey(staking.TStoreKey),
-		keyMint:          sdk.NewKVStoreKey(mint.StoreKey),
-		keyDistr:         sdk.NewKVStoreKey(distr.StoreKey),
-		tkeyDistr:        sdk.NewTransientStoreKey(distr.TStoreKey),
-		keySlashing:      sdk.NewKVStoreKey(slashing.StoreKey),
-		keyGov:           sdk.NewKVStoreKey(gov.StoreKey),
-		keyFeeCollection: sdk.NewKVStoreKey(auth.FeeStoreKey),
-		keyParams:        sdk.NewKVStoreKey(params.StoreKey),
-		tkeyParams:       sdk.NewTransientStoreKey(params.TStoreKey),
+		BaseApp:        bApp,
+		cdc:            cdc,
+		invCheckPeriod: invCheckPeriod,
+		keys:           keys,
+		tkeys:          tkeys,
 	}
 
-	app.paramsKeeper = params.NewKeeper(app.cdc, app.keyParams, app.tkeyParams)
+	// init params keeper and subspaces
+	app.paramsKeeper = params.NewKeeper(app.cdc, keys[params.StoreKey], tkeys[params.TStoreKey])
+	authSubspace := app.paramsKeeper.Subspace(auth.DefaultParamspace)
+	bankSubspace := app.paramsKeeper.Subspace(bank.DefaultParamspace)
+	stakingSubspace := app.paramsKeeper.Subspace(staking.DefaultParamspace)
+	mintSubspace := app.paramsKeeper.Subspace(mint.DefaultParamspace)
+	distrSubspace := app.paramsKeeper.Subspace(distr.DefaultParamspace)
+	slashingSubspace := app.paramsKeeper.Subspace(slashing.DefaultParamspace)
+	govSubspace := app.paramsKeeper.Subspace(gov.DefaultParamspace).WithKeyTable(gov.ParamKeyTable())
+	evidenceSubspace := app.paramsKeeper.Subspace(evidence.DefaultParamspace)
+	crisisSubspace := app.paramsKeeper.Subspace(crisis.DefaultParamspace)
+	auctionSubspace := app.paramsKeeper.Subspace(auction.DefaultParamspace)
+	cdpSubspace := app.paramsKeeper.Subspace(cdp.DefaultParamspace)
+	pricefeedSubspace := app.paramsKeeper.Subspace(pricefeed.DefaultParamspace)
+	bep3Subspace := app.paramsKeeper.Subspace(bep3.DefaultParamspace)
+	kavadistSubspace := app.paramsKeeper.Subspace(kavadist.DefaultParamspace)
+	incentiveSubspace := app.paramsKeeper.Subspace(incentive.DefaultParamspace)
 
-	// define the accountKeeper
+	// add keepers
 	app.accountKeeper = auth.NewAccountKeeper(
 		app.cdc,
-		app.keyAccount,
-		app.paramsKeeper.Subspace(auth.DefaultParamspace),
+		keys[auth.StoreKey],
+		authSubspace,
 		auth.ProtoBaseAccount,
 	)
-
-	// add handlers
 	app.bankKeeper = bank.NewBaseKeeper(
 		app.accountKeeper,
-		app.paramsKeeper.Subspace(bank.DefaultParamspace),
-		bank.DefaultCodespace,
+		bankSubspace,
+		app.ModuleAccountAddrs(),
 	)
-	app.feeCollectionKeeper = auth.NewFeeCollectionKeeper(
+	app.supplyKeeper = supply.NewKeeper(
 		app.cdc,
-		app.keyFeeCollection,
+		keys[supply.StoreKey],
+		app.accountKeeper,
+		app.bankKeeper,
+		mAccPerms,
 	)
 	stakingKeeper := staking.NewKeeper(
 		app.cdc,
-		app.keyStaking, app.tkeyStaking,
-		app.bankKeeper, app.paramsKeeper.Subspace(staking.DefaultParamspace),
-		staking.DefaultCodespace,
+		keys[staking.StoreKey],
+		app.supplyKeeper,
+		stakingSubspace,
 	)
-	app.mintKeeper = mint.NewKeeper(app.cdc, app.keyMint,
-		app.paramsKeeper.Subspace(mint.DefaultParamspace),
-		&stakingKeeper, app.feeCollectionKeeper,
+	app.mintKeeper = mint.NewKeeper(
+		app.cdc,
+		keys[mint.StoreKey],
+		mintSubspace,
+		&stakingKeeper,
+		app.supplyKeeper,
+		auth.FeeCollectorName,
 	)
 	app.distrKeeper = distr.NewKeeper(
 		app.cdc,
-		app.keyDistr,
-		app.paramsKeeper.Subspace(distr.DefaultParamspace),
-		app.bankKeeper, &stakingKeeper, app.feeCollectionKeeper,
-		distr.DefaultCodespace,
+		keys[distr.StoreKey],
+		distrSubspace,
+		&stakingKeeper,
+		app.supplyKeeper,
+		auth.FeeCollectorName,
+		app.ModuleAccountAddrs(),
 	)
 	app.slashingKeeper = slashing.NewKeeper(
 		app.cdc,
-		app.keySlashing,
-		&stakingKeeper, app.paramsKeeper.Subspace(slashing.DefaultParamspace),
-		slashing.DefaultCodespace,
-	)
-	app.govKeeper = gov.NewKeeper(
-		app.cdc,
-		app.keyGov,
-		app.paramsKeeper, app.paramsKeeper.Subspace(gov.DefaultParamspace), app.bankKeeper, &stakingKeeper,
-		gov.DefaultCodespace,
+		keys[slashing.StoreKey],
+		&stakingKeeper,
+		slashingSubspace,
 	)
 	app.crisisKeeper = crisis.NewKeeper(
-		app.paramsKeeper.Subspace(crisis.DefaultParamspace),
-		app.distrKeeper,
+		crisisSubspace,
+		invCheckPeriod,
+		app.supplyKeeper,
+		auth.FeeCollectorName,
+	)
+
+	// create evidence keeper with router
+	evidenceKeeper := evidence.NewKeeper(
+		app.cdc,
+		keys[evidence.StoreKey],
+		evidenceSubspace,
+		&app.stakingKeeper,
+		app.slashingKeeper,
+	)
+	evidenceRouter := evidence.NewRouter()
+	evidenceKeeper.SetRouter(evidenceRouter)
+	app.evidenceKeeper = *evidenceKeeper
+
+	// create committee keeper with router
+	committeeGovRouter := gov.NewRouter()
+	committeeGovRouter.
+		AddRoute(gov.RouterKey, gov.ProposalHandler).
+		AddRoute(params.RouterKey, params.NewParamChangeProposalHandler(app.paramsKeeper)).
+		AddRoute(distr.RouterKey, distr.NewCommunityPoolSpendProposalHandler(app.distrKeeper))
+	// Note: the committee proposal handler is not registered on the committee router. This means committees cannot create or update other committees.
+	// Adding the committee proposal handler to the router is possible but awkward as the handler depends on the keeper which depends on the handler.
+	app.committeeKeeper = committee.NewKeeper(
+		app.cdc,
+		keys[committee.StoreKey],
+		committeeGovRouter, // TODO blacklist module addresses?
+	)
+
+	// create gov keeper with router
+	govRouter := gov.NewRouter()
+	govRouter.
+		AddRoute(gov.RouterKey, gov.ProposalHandler).
+		AddRoute(params.RouterKey, params.NewParamChangeProposalHandler(app.paramsKeeper)).
+		AddRoute(distr.RouterKey, distr.NewCommunityPoolSpendProposalHandler(app.distrKeeper)).
+		AddRoute(committee.RouterKey, committee.NewProposalHandler(app.committeeKeeper))
+	app.govKeeper = gov.NewKeeper(
+		app.cdc,
+		keys[gov.StoreKey],
+		govSubspace,
+		app.supplyKeeper,
+		&stakingKeeper,
+		govRouter,
+	)
+
+	app.vvKeeper = validatorvesting.NewKeeper(
+		app.cdc,
+		keys[validatorvesting.StoreKey],
+		app.accountKeeper,
 		app.bankKeeper,
-		app.feeCollectionKeeper,
+		app.supplyKeeper,
+		&stakingKeeper,
+	)
+	app.pricefeedKeeper = pricefeed.NewKeeper(
+		app.cdc,
+		keys[pricefeed.StoreKey],
+		pricefeedSubspace,
+	)
+	app.auctionKeeper = auction.NewKeeper(
+		app.cdc,
+		keys[auction.StoreKey],
+		app.supplyKeeper,
+		auctionSubspace,
+	)
+	app.cdpKeeper = cdp.NewKeeper(
+		app.cdc,
+		keys[cdp.StoreKey],
+		cdpSubspace,
+		app.pricefeedKeeper,
+		app.auctionKeeper,
+		app.supplyKeeper,
+		app.accountKeeper,
+	)
+	app.bep3Keeper = bep3.NewKeeper(
+		app.cdc,
+		keys[bep3.StoreKey],
+		app.supplyKeeper,
+		bep3Subspace,
+	)
+	app.kavadistKeeper = kavadist.NewKeeper(
+		app.cdc,
+		keys[kavadist.StoreKey],
+		kavadistSubspace,
+		app.supplyKeeper,
+	)
+	app.incentiveKeeper = incentive.NewKeeper(
+		app.cdc,
+		keys[incentive.StoreKey],
+		incentiveSubspace,
+		app.supplyKeeper,
+		app.cdpKeeper,
+		app.accountKeeper,
 	)
 
 	// register the staking hooks
-	// NOTE: The stakingKeeper above is passed by reference, so that it can be
-	// modified like below:
+	// NOTE: stakingKeeper above is passed by reference, so that it will contain these hooks
 	app.stakingKeeper = *stakingKeeper.SetHooks(
-		NewStakingHooks(app.distrKeeper.Hooks(), app.slashingKeeper.Hooks()),
+		staking.NewMultiStakingHooks(app.distrKeeper.Hooks(), app.slashingKeeper.Hooks()))
+
+	// create the module manager (Note: Any module instantiated in the module manager that is later modified
+	// must be passed by reference here.)
+	app.mm = module.NewManager(
+		genutil.NewAppModule(app.accountKeeper, app.stakingKeeper, app.BaseApp.DeliverTx),
+		auth.NewAppModule(app.accountKeeper),
+		bank.NewAppModule(app.bankKeeper, app.accountKeeper),
+		crisis.NewAppModule(&app.crisisKeeper),
+		supply.NewAppModule(app.supplyKeeper, app.accountKeeper),
+		gov.NewAppModule(app.govKeeper, app.accountKeeper, app.supplyKeeper),
+		mint.NewAppModule(app.mintKeeper),
+		slashing.NewAppModule(app.slashingKeeper, app.accountKeeper, app.stakingKeeper),
+		distr.NewAppModule(app.distrKeeper, app.accountKeeper, app.supplyKeeper, app.stakingKeeper),
+		staking.NewAppModule(app.stakingKeeper, app.accountKeeper, app.supplyKeeper),
+		evidence.NewAppModule(app.evidenceKeeper),
+		validatorvesting.NewAppModule(app.vvKeeper, app.accountKeeper),
+		auction.NewAppModule(app.auctionKeeper, app.accountKeeper, app.supplyKeeper),
+		cdp.NewAppModule(app.cdpKeeper, app.accountKeeper, app.pricefeedKeeper, app.supplyKeeper),
+		pricefeed.NewAppModule(app.pricefeedKeeper, app.accountKeeper),
+		bep3.NewAppModule(app.bep3Keeper, app.accountKeeper, app.supplyKeeper),
+		kavadist.NewAppModule(app.kavadistKeeper, app.supplyKeeper),
+		incentive.NewAppModule(app.incentiveKeeper, app.accountKeeper, app.supplyKeeper),
+		committee.NewAppModule(app.committeeKeeper, app.accountKeeper),
 	)
 
-	// register the crisis routes
-	bank.RegisterInvariants(&app.crisisKeeper, app.accountKeeper)
-	distr.RegisterInvariants(&app.crisisKeeper, app.distrKeeper, app.stakingKeeper)
-	staking.RegisterInvariants(&app.crisisKeeper, app.stakingKeeper, app.feeCollectionKeeper, app.distrKeeper, app.accountKeeper)
+	// During begin block slashing happens after distr.BeginBlocker so that
+	// there is nothing left over in the validator fee pool, so as to keep the
+	// CanWithdrawInvariant invariant.
+	// Auction.BeginBlocker will close out expired auctions and pay debt back to cdp.
+	// So it should be run before cdp.BeginBlocker which cancels out debt with stable and starts more auctions.
+	app.mm.SetOrderBeginBlockers(mint.ModuleName, distr.ModuleName, slashing.ModuleName, validatorvesting.ModuleName, kavadist.ModuleName, auction.ModuleName, cdp.ModuleName, bep3.ModuleName, incentive.ModuleName, committee.ModuleName)
 
-	// register message routes
-	app.Router().
-		AddRoute(bank.RouterKey, bank.NewHandler(app.bankKeeper)).
-		AddRoute(staking.RouterKey, staking.NewHandler(app.stakingKeeper)).
-		AddRoute(distr.RouterKey, distr.NewHandler(app.distrKeeper)).
-		AddRoute(slashing.RouterKey, slashing.NewHandler(app.slashingKeeper)).
-		AddRoute(gov.RouterKey, gov.NewHandler(app.govKeeper)).
-		AddRoute(crisis.RouterKey, crisis.NewHandler(app.crisisKeeper))
+	app.mm.SetOrderEndBlockers(crisis.ModuleName, gov.ModuleName, staking.ModuleName, pricefeed.ModuleName)
 
-	app.QueryRouter().
-		AddRoute(auth.QuerierRoute, auth.NewQuerier(app.accountKeeper)).
-		AddRoute(distr.QuerierRoute, distr.NewQuerier(app.distrKeeper)).
-		AddRoute(gov.QuerierRoute, gov.NewQuerier(app.govKeeper)).
-		AddRoute(slashing.QuerierRoute, slashing.NewQuerier(app.slashingKeeper, app.cdc)).
-		AddRoute(staking.QuerierRoute, staking.NewQuerier(app.stakingKeeper, app.cdc)).
-		AddRoute(mint.QuerierRoute, mint.NewQuerier(app.mintKeeper))
-
-	// initialize BaseApp
-	app.MountStores(app.keyMain, app.keyAccount, app.keyStaking, app.keyMint, app.keyDistr,
-		app.keySlashing, app.keyGov, app.keyFeeCollection, app.keyParams,
-		app.tkeyParams, app.tkeyStaking, app.tkeyDistr,
+	app.mm.SetOrderInitGenesis(
+		auth.ModuleName, // loads all accounts - should run before any module with a module account
+		validatorvesting.ModuleName, distr.ModuleName,
+		staking.ModuleName, bank.ModuleName, slashing.ModuleName,
+		gov.ModuleName, mint.ModuleName, evidence.ModuleName,
+		pricefeed.ModuleName, cdp.ModuleName, auction.ModuleName,
+		bep3.ModuleName, kavadist.ModuleName, incentive.ModuleName, committee.ModuleName,
+		supply.ModuleName,  // calculates the total supply from account - should run after modules that modify accounts in genesis
+		crisis.ModuleName,  // runs the invariants at genesis - should run after other modules
+		genutil.ModuleName, // genutils must occur after staking so that pools are properly initialized with tokens from genesis accounts.
 	)
-	app.SetInitChainer(app.initChainer)
+
+	app.mm.RegisterInvariants(&app.crisisKeeper)
+	app.mm.RegisterRoutes(app.Router(), app.QueryRouter())
+
+	// create the simulation manager and define the order of the modules for deterministic simulations
+	//
+	// NOTE: This is not required for apps that don't use the simulator for fuzz testing
+	// transactions.
+	app.sm = module.NewSimulationManager(
+		auth.NewAppModule(app.accountKeeper),
+		validatorvesting.NewAppModule(app.vvKeeper, app.accountKeeper),
+		bank.NewAppModule(app.bankKeeper, app.accountKeeper),
+		supply.NewAppModule(app.supplyKeeper, app.accountKeeper),
+		gov.NewAppModule(app.govKeeper, app.accountKeeper, app.supplyKeeper),
+		mint.NewAppModule(app.mintKeeper),
+		distr.NewAppModule(app.distrKeeper, app.accountKeeper, app.supplyKeeper, app.stakingKeeper),
+		staking.NewAppModule(app.stakingKeeper, app.accountKeeper, app.supplyKeeper),
+		slashing.NewAppModule(app.slashingKeeper, app.accountKeeper, app.stakingKeeper),
+		pricefeed.NewAppModule(app.pricefeedKeeper, app.accountKeeper),
+		cdp.NewAppModule(app.cdpKeeper, app.accountKeeper, app.pricefeedKeeper, app.supplyKeeper),
+		auction.NewAppModule(app.auctionKeeper, app.accountKeeper, app.supplyKeeper),
+		bep3.NewAppModule(app.bep3Keeper, app.accountKeeper, app.supplyKeeper),
+		kavadist.NewAppModule(app.kavadistKeeper, app.supplyKeeper),
+		incentive.NewAppModule(app.incentiveKeeper, app.accountKeeper, app.supplyKeeper),
+		committee.NewAppModule(app.committeeKeeper, app.accountKeeper),
+	)
+
+	app.sm.RegisterStoreDecoders()
+
+	// initialize stores
+	app.MountKVStores(keys)
+	app.MountTransientStores(tkeys)
+
+	// initialize the app
+	app.SetInitChainer(app.InitChainer)
 	app.SetBeginBlocker(app.BeginBlocker)
-	app.SetAnteHandler(auth.NewAnteHandler(app.accountKeeper, app.feeCollectionKeeper))
+	app.SetAnteHandler(auth.NewAnteHandler(app.accountKeeper, app.supplyKeeper, auth.DefaultSigVerificationGasConsumer))
 	app.SetEndBlocker(app.EndBlocker)
 
+	// load store
 	if loadLatest {
-		err := app.LoadLatestVersion(app.keyMain)
+		err := app.LoadLatestVersion(app.keys[bam.MainStoreKey])
 		if err != nil {
-			cmn.Exit(err.Error())
+			tmos.Exit(err.Error())
 		}
 	}
 
@@ -208,208 +430,75 @@ func NewApp(logger log.Logger, db dbm.DB, traceStore io.Writer, loadLatest bool,
 // custom tx codec
 func MakeCodec() *codec.Codec {
 	var cdc = codec.New()
-	bank.RegisterCodec(cdc)
-	staking.RegisterCodec(cdc)
-	distr.RegisterCodec(cdc)
-	slashing.RegisterCodec(cdc)
-	gov.RegisterCodec(cdc)
-	auth.RegisterCodec(cdc)
-	crisis.RegisterCodec(cdc)
+
+	ModuleBasics.RegisterCodec(cdc)
+	vesting.RegisterCodec(cdc)
 	sdk.RegisterCodec(cdc)
 	codec.RegisterCrypto(cdc)
-	return cdc
+	codec.RegisterEvidences(cdc)
+
+	return cdc.Seal()
 }
 
+// SetBech32AddressPrefixes sets the global prefix to be used when serializing addresses to bech32 strings.
 func SetBech32AddressPrefixes(config *sdk.Config) {
 	config.SetBech32PrefixForAccount(Bech32MainPrefix, Bech32MainPrefix+sdk.PrefixPublic)
 	config.SetBech32PrefixForValidator(Bech32MainPrefix+sdk.PrefixValidator+sdk.PrefixOperator, Bech32MainPrefix+sdk.PrefixValidator+sdk.PrefixOperator+sdk.PrefixPublic)
 	config.SetBech32PrefixForConsensusNode(Bech32MainPrefix+sdk.PrefixValidator+sdk.PrefixConsensus, Bech32MainPrefix+sdk.PrefixValidator+sdk.PrefixConsensus+sdk.PrefixPublic)
 }
 
+// SetBip44CoinType sets the global coin type to be used in hierarchical deterministic wallets.
+func SetBip44CoinType(config *sdk.Config) {
+	config.SetCoinType(Bip44CoinType)
+}
+
 // application updates every end block
 func (app *App) BeginBlocker(ctx sdk.Context, req abci.RequestBeginBlock) abci.ResponseBeginBlock {
-	// mint new tokens for the previous block
-	mint.BeginBlocker(ctx, app.mintKeeper)
-
-	// distribute rewards for the previous block
-	distr.BeginBlocker(ctx, req, app.distrKeeper)
-
-	// slash anyone who double signed.
-	// NOTE: This should happen after distr.BeginBlocker so that
-	// there is nothing left over in the validator fee pool,
-	// so as to keep the CanWithdrawInvariant invariant.
-	// TODO: This should really happen at EndBlocker.
-	tags := slashing.BeginBlocker(ctx, req, app.slashingKeeper)
-
-	return abci.ResponseBeginBlock{
-		Tags: tags.ToKVPairs(),
-	}
+	return app.mm.BeginBlock(ctx, req)
 }
 
 // application updates every end block
-// nolint: unparam
 func (app *App) EndBlocker(ctx sdk.Context, req abci.RequestEndBlock) abci.ResponseEndBlock {
-	tags := gov.EndBlocker(ctx, app.govKeeper)
-	validatorUpdates, endBlockerTags := staking.EndBlocker(ctx, app.stakingKeeper)
-	tags = append(tags, endBlockerTags...)
-
-	if app.invCheckPeriod != 0 && ctx.BlockHeight()%int64(app.invCheckPeriod) == 0 {
-		app.assertRuntimeInvariants()
-	}
-
-	return abci.ResponseEndBlock{
-		ValidatorUpdates: validatorUpdates,
-		Tags:             tags,
-	}
-}
-
-// initialize store from a genesis state
-func (app *App) initFromGenesisState(ctx sdk.Context, genesisState GenesisState) []abci.ValidatorUpdate {
-	genesisState.Sanitize()
-
-	// load the accounts
-	for _, gacc := range genesisState.Accounts {
-		acc := gacc.ToAccount()
-		acc = app.accountKeeper.NewAccount(ctx, acc) // set account number
-		app.accountKeeper.SetAccount(ctx, acc)
-	}
-
-	// initialize distribution (must happen before staking)
-	distr.InitGenesis(ctx, app.distrKeeper, genesisState.DistrData)
-
-	// load the initial staking information
-	validators, err := staking.InitGenesis(ctx, app.stakingKeeper, genesisState.StakingData)
-	if err != nil {
-		panic(err) // TODO find a way to do this w/o panics
-	}
-
-	// initialize module-specific stores
-	auth.InitGenesis(ctx, app.accountKeeper, app.feeCollectionKeeper, genesisState.AuthData)
-	bank.InitGenesis(ctx, app.bankKeeper, genesisState.BankData)
-	slashing.InitGenesis(ctx, app.slashingKeeper, genesisState.SlashingData, genesisState.StakingData.Validators.ToSDKValidators())
-	gov.InitGenesis(ctx, app.govKeeper, genesisState.GovData)
-	crisis.InitGenesis(ctx, app.crisisKeeper, genesisState.CrisisData)
-	mint.InitGenesis(ctx, app.mintKeeper, genesisState.MintData)
-
-	// validate genesis state
-	if err := ValidateGenesisState(genesisState); err != nil {
-		panic(err) // TODO find a way to do this w/o panics
-	}
-
-	if len(genesisState.GenTxs) > 0 {
-		for _, genTx := range genesisState.GenTxs {
-			var tx auth.StdTx
-			err = app.cdc.UnmarshalJSON(genTx, &tx)
-			if err != nil {
-				panic(err)
-			}
-			bz := app.cdc.MustMarshalBinaryLengthPrefixed(tx)
-			res := app.BaseApp.DeliverTx(bz)
-			if !res.IsOK() {
-				panic(res.Log)
-			}
-		}
-
-		validators = app.stakingKeeper.ApplyAndReturnValidatorSetUpdates(ctx)
-	}
-	return validators
+	return app.mm.EndBlock(ctx, req)
 }
 
 // custom logic for app initialization
-func (app *App) initChainer(ctx sdk.Context, req abci.RequestInitChain) abci.ResponseInitChain {
-	stateJSON := req.AppStateBytes
-	// TODO is this now the whole genesis file?
-
+func (app *App) InitChainer(ctx sdk.Context, req abci.RequestInitChain) abci.ResponseInitChain {
 	var genesisState GenesisState
-	err := app.cdc.UnmarshalJSON(stateJSON, &genesisState)
-	if err != nil {
-		panic(err) // TODO https://github.com/cosmos/cosmos-sdk/issues/468
-		// return sdk.ErrGenesisParse("").TraceCause(err, "")
-	}
-
-	validators := app.initFromGenesisState(ctx, genesisState)
-
-	// sanity check
-	if len(req.Validators) > 0 {
-		if len(req.Validators) != len(validators) {
-			panic(fmt.Errorf("len(RequestInitChain.Validators) != len(validators) (%d != %d)",
-				len(req.Validators), len(validators)))
-		}
-		sort.Sort(abci.ValidatorUpdates(req.Validators))
-		sort.Sort(abci.ValidatorUpdates(validators))
-		for i, val := range validators {
-			if !val.Equal(req.Validators[i]) {
-				panic(fmt.Errorf("validators[%d] != req.Validators[%d] ", i, i))
-			}
-		}
-	}
-
-	// assert runtime invariants
-	app.assertRuntimeInvariants()
-
-	return abci.ResponseInitChain{
-		Validators: validators,
-	}
+	app.cdc.MustUnmarshalJSON(req.AppStateBytes, &genesisState)
+	return app.mm.InitGenesis(ctx, genesisState)
 }
 
 // load a particular height
 func (app *App) LoadHeight(height int64) error {
-	return app.LoadVersion(height, app.keyMain)
+	return app.LoadVersion(height, app.keys[bam.MainStoreKey])
 }
 
-// ______________________________________________________________________________________________
+// ModuleAccountAddrs returns all the app's module account addresses.
+func (app *App) ModuleAccountAddrs() map[string]bool {
+	modAccAddrs := make(map[string]bool)
+	for acc := range mAccPerms {
+		modAccAddrs[supply.NewModuleAddress(acc).String()] = true
+	}
 
-var _ sdk.StakingHooks = StakingHooks{}
-
-// StakingHooks contains combined distribution and slashing hooks needed for the
-// staking module.
-type StakingHooks struct {
-	dh distr.Hooks
-	sh slashing.Hooks
-}
-
-func NewStakingHooks(dh distr.Hooks, sh slashing.Hooks) StakingHooks {
-	return StakingHooks{dh, sh}
+	return modAccAddrs
 }
 
-// nolint
-func (h StakingHooks) AfterValidatorCreated(ctx sdk.Context, valAddr sdk.ValAddress) {
-	h.dh.AfterValidatorCreated(ctx, valAddr)
-	h.sh.AfterValidatorCreated(ctx, valAddr)
+// Codec returns the application's sealed codec.
+func (app *App) Codec() *codec.Codec {
+	return app.cdc
 }
-func (h StakingHooks) BeforeValidatorModified(ctx sdk.Context, valAddr sdk.ValAddress) {
-	h.dh.BeforeValidatorModified(ctx, valAddr)
-	h.sh.BeforeValidatorModified(ctx, valAddr)
+
+// SimulationManager implements the SimulationApp interface
+func (app *App) SimulationManager() *module.SimulationManager {
+	return app.sm
 }
-func (h StakingHooks) AfterValidatorRemoved(ctx sdk.Context, consAddr sdk.ConsAddress, valAddr sdk.ValAddress) {
-	h.dh.AfterValidatorRemoved(ctx, consAddr, valAddr)
-	h.sh.AfterValidatorRemoved(ctx, consAddr, valAddr)
-}
-func (h StakingHooks) AfterValidatorBonded(ctx sdk.Context, consAddr sdk.ConsAddress, valAddr sdk.ValAddress) {
-	h.dh.AfterValidatorBonded(ctx, consAddr, valAddr)
-	h.sh.AfterValidatorBonded(ctx, consAddr, valAddr)
-}
-func (h StakingHooks) AfterValidatorBeginUnbonding(ctx sdk.Context, consAddr sdk.ConsAddress, valAddr sdk.ValAddress) {
-	h.dh.AfterValidatorBeginUnbonding(ctx, consAddr, valAddr)
-	h.sh.AfterValidatorBeginUnbonding(ctx, consAddr, valAddr)
-}
-func (h StakingHooks) BeforeDelegationCreated(ctx sdk.Context, delAddr sdk.AccAddress, valAddr sdk.ValAddress) {
-	h.dh.BeforeDelegationCreated(ctx, delAddr, valAddr)
-	h.sh.BeforeDelegationCreated(ctx, delAddr, valAddr)
-}
-func (h StakingHooks) BeforeDelegationSharesModified(ctx sdk.Context, delAddr sdk.AccAddress, valAddr sdk.ValAddress) {
-	h.dh.BeforeDelegationSharesModified(ctx, delAddr, valAddr)
-	h.sh.BeforeDelegationSharesModified(ctx, delAddr, valAddr)
-}
-func (h StakingHooks) BeforeDelegationRemoved(ctx sdk.Context, delAddr sdk.AccAddress, valAddr sdk.ValAddress) {
-	h.dh.BeforeDelegationRemoved(ctx, delAddr, valAddr)
-	h.sh.BeforeDelegationRemoved(ctx, delAddr, valAddr)
-}
-func (h StakingHooks) AfterDelegationModified(ctx sdk.Context, delAddr sdk.AccAddress, valAddr sdk.ValAddress) {
-	h.dh.AfterDelegationModified(ctx, delAddr, valAddr)
-	h.sh.AfterDelegationModified(ctx, delAddr, valAddr)
-}
-func (h StakingHooks) BeforeValidatorSlashed(ctx sdk.Context, valAddr sdk.ValAddress, fraction sdk.Dec) {
-	h.dh.BeforeValidatorSlashed(ctx, valAddr, fraction)
-	h.sh.BeforeValidatorSlashed(ctx, valAddr, fraction)
+
+// GetMaccPerms returns a mapping of the application's module account permissions.
+func GetMaccPerms() map[string][]string {
+	perms := make(map[string][]string)
+	for k, v := range mAccPerms {
+		perms[k] = v
+	}
+	return perms
 }

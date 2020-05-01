@@ -5,6 +5,8 @@
 
 <div align="center">
 
+[![version](https://img.shields.io/github/tag/kava-labs/kava.svg)](https://github.com/kava-labs/kava/releases/latest)
+[![CircleCI](https://circleci.com/gh/Kava-Labs/kava/tree/master.svg?style=shield)](https://circleci.com/gh/Kava-Labs/kava/tree/master)
 [![Go Report Card](https://goreportcard.com/badge/github.com/kava-labs/kava)](https://goreportcard.com/report/github.com/kava-labs/kava)
 [![API Reference](https://godoc.org/github.com/Kava-Labs/kava?status.svg)](https://godoc.org/github.com/Kava-Labs/kava)
 [![GitHub](https://img.shields.io/github/license/kava-labs/kava.svg)](https://github.com/Kava-Labs/kava/blob/master/LICENSE.md)
@@ -17,48 +19,27 @@
 
 ### [Telegram](https://t.me/kavalabs) | [Medium](https://medium.com/kava-labs) | [Validator Chat](https://riot.im/app/#/room/#kava-validators:matrix.org)
 
-### Participate in the Kava testnet and [snag a founder badge](./docs/REWARDS.md)!
-
 </div>
 
-## Installing
+Reference implementation of Kava, a blockchain for cross-chain DeFi. Built using the [cosmos-sdk](https://github.com/cosmos/cosmos-sdk).
 
-This guide assumes you have worked with `cosmos-sdk` blockchains previously. If you are just getting started, great! See the complete guide [here](https://medium.com/kava-labs).
+## Mainnet
 
-#### Installing KVD
+Note, the current recommended version of the software for mainnet is v0.3.2. The master branch of this repository contains considerable development work since the last mainnet release and is __not__ runnable on mainnet.
 
-```
-git clone https://github.com/Kava-Labs/kava.git
-cd kava
-# Ensure GO Modules are enabled
-export GO111MODULE=on
+### Installation
+
+```sh
+git checkout v0.3.2
 make install
 ```
 
-#### Create a Wallet
+## Testnet
 
-```
-kvd init --chain-id=kava-testnet-1.1 <your-moniker>
-kvcli keys add <your_wallet_name>
-```
-
-**Be sure to back up your mnemonic!**
-
-#### Create a Genesis Transaction
-
-```
-kvd add-genesis-account $(kvcli keys show <your_wallet_name> -a) 1000000000000ukva
-kvd gentx --name <your_wallet_name> --amount 1000000000000ukva --ip <your-public-ip>
-```
-
-A genesis transaction should be written to `$HOME/.kvd/config/gentx/gentx-<gen_tx_hash>.json`
-
-#### Submit Genesis Transaction
-
-To be included in the genesis file for testnet one, fork this repo and copy your genesis transaction to the `testnet-1.1/gentx` directory. Submit your fork including your genesis transaction as a PR on this repo [here](https://github.com/Kava-Labs/kava/pulls)
+The recommended version of the software for kava-testnet-4000 is v0.4.1. For further information on joining the testnet, head over to the [testnet repo](https://github.com/Kava-Labs/kava-testnets).
 
 ## License
 
 Copyright © Kava Labs, Inc. All rights reserved.
 
-Licensed under the [Apache v2 License](LICENSE).
+Licensed under the [Apache v2 License](LICENSE.md).

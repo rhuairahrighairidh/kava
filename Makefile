@@ -1,10 +1,8 @@
 #!/usr/bin/make -f
 
-PACKAGES_SIMTEST=$(shell go list ./... | grep '/simulation')
-VERSION := 0.34.7
+VERSION := $(shell echo $(shell git describe --tags) | sed 's/^v//')
 COMMIT := $(shell git log -1 --format='%H')
 LEDGER_ENABLED ?= true
-SDK_PACK := $(shell go list -m github.com/cosmos/cosmos-sdk | sed  's/ /\@/g')
 
 export GO111MODULE = on
 
@@ -63,7 +61,7 @@ ldflags := $(strip $(ldflags))
 BUILD_FLAGS := -tags "$(build_tags)" -ldflags '$(ldflags)'
 
 
-all: install lint check
+all: install
 
 build: go.sum
 ifeq ($(OS),Windows_NT)
@@ -77,7 +75,7 @@ endif
 build-linux: go.sum
 	LEDGER_ENABLED=false GOOS=linux GOARCH=amd64 $(MAKE) build
 
-install: go.sum check-ledger
+install: go.sum
 	go install -mod=readonly $(BUILD_FLAGS) ./cmd/kvd
 	go install -mod=readonly $(BUILD_FLAGS) ./cmd/kvcli
 
@@ -87,19 +85,90 @@ install: go.sum check-ledger
 go-mod-cache: go.sum
 	@echo "--> Download go modules to local cache"
 	@go mod download
+PHONY: go-mod-cache
 
 go.sum: go.mod
-	@echo "--> Ensure dependencies have not been modified"
+	@echo "--> Ensuring dependencies have not been modified"
 	@go mod verify
-
-draw-deps:
-	@# requires brew install graphviz or apt-get install graphviz
-	go get github.com/RobotsAndPencils/goviz
-	@goviz -i ./cmd/gaiad -d 2 | dot -Tpng -o dependency-graph.png
 
 clean:
 	rm -rf build/
 
-.PHONY: all build-linux install \
-	go-mod-cache draw-deps clean build \
-	check-ledger
+########################################
+### Linting
+
+# Check url links in the repo are not broken.
+# This tool checks local markdown links as well.
+# Set to exclude riot links as they trigger false positives
+link-check:
+	@go run github.com/raviqqe/liche -r . --exclude "^http://127.*|^https://riot.im/app*|^http://kava-testnet*|^https://testnet-dex*"
+
+
+lint:
+	golangci-lint run
+	find . -name '*.go' -type f -not -path "./vendor*" -not -path "*.git*" | xargs gofmt -d -s
+	go mod verify
+.PHONY: lint
+
+format:
+	find . -name '*.go' -type f -not -path "./vendor*" -not -path "*.git*" -not -name '*.pb.go' | xargs gofmt -w -s
+	find . -name '*.go' -type f -not -path "./vendor*" -not -path "*.git*" -not -name '*.pb.go' | xargs misspell -w
+	find . -name '*.go' -type f -not -path "./vendor*" -not -path "*.git*" -not -name '*.pb.go' | xargs goimports -w -local github.com/tendermint
+	find . -name '*.go' -type f -not -path "./vendor*" -not -path "*.git*" -not -name '*.pb.go' | xargs goimports -w -local github.com/cosmos/cosmos-sdk
+	find . -name '*.go' -type f -not -path "./vendor*" -not -path "*.git*" -not -name '*.pb.go' | xargs goimports -w -local github.com/kava-labs/kava
+.PHONY: format
+
+########################################
+### Testing
+
+# TODO tidy up cli tests to use same -Enable flag as simulations, or the other way round
+# TODO -mod=readonly ?
+# build dependency needed for cli tests
+test-all: build
+	# basic app tests
+	@go test ./app -v
+	# basic simulation (seed "4" happens to not unbond all validators before reaching 100 blocks)
+	@go test ./app -run TestFullAppSimulation        -Enabled -Commit -NumBlocks=100 -BlockSize=200 -Seed 4 -v -timeout 24h
+	# other sim tests
+	@go test ./app -run TestAppImportExport          -Enabled -Commit -NumBlocks=100 -BlockSize=200 -Seed 4 -v -timeout 24h
+	@go test ./app -run TestAppSimulationAfterImport -Enabled -Commit -NumBlocks=100 -BlockSize=200 -Seed 4 -v -timeout 24h
+	@# AppStateDeterminism does not use Seed flag
+	@go test ./app -run TestAppStateDeterminism      -Enabled -Commit -NumBlocks=100 -BlockSize=200 -Seed 4 -v -timeout 24h
+
+# run module tests and short simulations
+test-basic: test
+	@go test ./app -run TestFullAppSimulation        -Enabled -Commit -NumBlocks=5 -BlockSize=200 -Seed 4 -v -timeout 2m
+	# other sim tests
+	@go test ./app -run TestAppImportExport          -Enabled -Commit -NumBlocks=5 -BlockSize=200 -Seed 4 -v -timeout 2m
+	@go test ./app -run TestAppSimulationAfterImport -Enabled -Commit -NumBlocks=5 -BlockSize=200 -Seed 4 -v -timeout 2m
+	@# AppStateDeterminism does not use Seed flag
+	@go test ./app -run TestAppStateDeterminism      -Enabled -Commit -NumBlocks=5 -BlockSize=200 -Seed 4 -v -timeout 2m
+
+test:
+	@go test ./...
+
+test-rest:
+	rest_test/./run_all_tests_from_make.sh
+
+# Run cli integration tests
+# `-p 4` to use 4 cores, `-tags cli_test` to tell go not to ignore the cli package
+# These tests use the `kvd` or `kvcli` binaries in the build dir, or in `$BUILDDIR` if that env var is set.
+test-cli: build
+	@go test ./cli_test -tags cli_test -v -p 4
+
+# Kick start lots of sims on an AWS cluster.
+# This submits an AWS Batch job to run a lot of sims, each within a docker image. Results are uploaded to S3
+start-remote-sims:
+	# build the image used for running sims in, and tag it
+	docker build -f simulations/Dockerfile -t kava/kava-sim:master .
+	# push that image to the hub
+	docker push kava/kava-sim:master
+	# submit an array job on AWS Batch, using 1000 seeds, spot instances
+	aws batch submit-job \
+		-—job-name "master-$(VERSION)" \
+		-—job-queue “simulation-1-queue-spot" \
+		-—array-properties size=1000 \
+		-—job-definition kava-sim-master \
+		-—container-override environment=[{SIM_NAME=master-$(VERSION)}]
+
+.PHONY: all build-linux install clean build test test-cli test-all test-rest test-basic start-remote-sims
